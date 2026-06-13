@@ -44,6 +44,7 @@
     "db:migrate:peak-pnl": "tsx --env-file=.env ./src/database/add-peak-pnl-column.ts",
     "db:migrate:partial-close": "tsx --env-file=.env ./src/database/migrate-add-partial-close.ts",
     "analyze:trades": "tsx --env-file=.env ./scripts/analyze-trades-by-symbol.ts",
+    "analyze:decisions": "tsx --env-file=.env ./scripts/analyze-decisions.ts",
     "demo:calculate-pnl": "tsx ./scripts/calculate-pnl-demo.ts",
     "test:websocket": "tsx --env-file=.env ./scripts/test-okx-websocket.ts",
     "pm2:start": "pm2 start ecosystem.config.cjs --only open-nof1.ai",

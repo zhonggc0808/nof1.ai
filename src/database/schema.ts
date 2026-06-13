@@ -33,6 +33,12 @@ export interface Trade {
   fee?: number;
   timestamp: string;
   status: 'pending' | 'filled' | 'cancelled';
+  strategy?: string;
+  strategy_version?: string;
+  prompt_version?: string;
+  decision_id?: number;
+  params_snapshot?: string;
+  decision_trace_id?: string;
 }
 
 export interface Position {
@@ -94,6 +100,14 @@ export interface AgentDecision {
   actions_taken: string;
   account_value: number;
   positions_count: number;
+  strategy?: string;
+  prompt_version?: string;
+  params_snapshot?: string;
+  market_regime?: string;
+  intended_action?: string;
+  decision_trace_id?: string;
+  target_symbol?: string;
+  confidence?: number;
 }
 
 export interface SystemConfig {
@@ -120,7 +134,13 @@ CREATE TABLE IF NOT EXISTS trades (
   pnl REAL,
   fee REAL,
   timestamp TEXT NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending'
+  status TEXT NOT NULL DEFAULT 'pending',
+  strategy TEXT,
+  strategy_version TEXT,
+  prompt_version TEXT,
+  decision_id INTEGER,
+  params_snapshot TEXT,
+  decision_trace_id TEXT
 );
 
 -- 持仓表
@@ -185,7 +205,15 @@ CREATE TABLE IF NOT EXISTS agent_decisions (
   decision TEXT NOT NULL,
   actions_taken TEXT NOT NULL,
   account_value REAL NOT NULL,
-  positions_count INTEGER NOT NULL
+  positions_count INTEGER NOT NULL,
+  strategy TEXT,
+  prompt_version TEXT,
+  params_snapshot TEXT,
+  market_regime TEXT,
+  intended_action TEXT,
+  decision_trace_id TEXT,
+  target_symbol TEXT,
+  confidence INTEGER
 );
 
 -- 系统配置表

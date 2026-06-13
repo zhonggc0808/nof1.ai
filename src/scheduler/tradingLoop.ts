@@ -23,8 +23,10 @@ import cron from "node-cron";
 import { createLogger } from "../utils/loggerUtils";
 import { createClient } from "@libsql/client";
 import { createTradingAgent, generateTradingPrompt, getAccountRiskConfig, getTradingStrategy, getStrategyParams } from "../agents/tradingAgent";
+import { setCurrentDecisionContext, clearCurrentDecisionContext } from "../agents/decisionContext";
 import { createExchangeClient } from "../services/exchangeClient";
 import { getChinaTimeISO } from "../utils/timeUtils";
+import crypto from "node:crypto";
 import { RISK_PARAMS } from "../config/riskParams";
 import { getQuantoMultiplier } from "../utils/contractUtils";
 import { initNewsClient, fetchCryptoNews, fetchExchangeAnnouncements, fetchLatestEvents, aggregateSentiment } from "../services/newsClient";
@@ -1164,11 +1166,86 @@ async function checkAccountThresholds(accountInfo: any): Promise<boolean> {
  * 执行交易决策
  * 优化：增强错误处理和数据验证，确保数据实时准确
  */
+/**
+ * JSON-first 结构化字段解析：优先从 ```json 代码块解析，失败则 fallback 到正则
+ */
+function parseStructuredDecisionFields(decisionText: string): {
+  intended_action?: string;
+  market_regime?: string;
+  target_symbol?: string;
+  confidence?: number | null;
+} {
+  // ─── JSON 优先 ───
+  try {
+    const jsonMatch = decisionText.match(/```json\s*([\s\S]*?)```/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[1]);
+      const confidence = clampConfidence(parsed.confidence);
+      logger.info(`JSON 解析成功: intended_action=${parsed.intended_action}, confidence=${confidence}`);
+      return {
+        intended_action: parsed.intended_action || undefined,
+        market_regime: parsed.market_regime || undefined,
+        target_symbol: parsed.target_symbol || undefined,
+        confidence,
+      };
+    }
+  } catch {
+    logger.warn("JSON 解析失败，fallback 到正则解析");
+  }
+
+  // ─── 正则 fallback ───
+  const result: Record<string, string | number | null> = {};
+
+  try {
+    const pattern = /^\s*(intended_action|market_regime|target_symbol|confidence)\s*:\s*(.+?)(?:\s*#.*)?$/gm;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(decisionText)) !== null) {
+      const key = match[1];
+      const value = match[2].trim();
+      if (value) {
+        if (key === 'confidence') {
+          result[key] = clampConfidence(value);
+        } else {
+          result[key] = value;
+        }
+      }
+    }
+  } catch {
+    logger.warn("正则解析结构化决策字段时出错，继续执行");
+  }
+
+  return {
+    intended_action: result.intended_action as string | undefined,
+    market_regime: result.market_regime as string | undefined,
+    target_symbol: result.target_symbol as string | undefined,
+    confidence: (result.confidence as number | null) ?? null,
+  };
+}
+
+/** 将任意值 clamp 到 0-100 的整数，无效输入返回 null */
+function clampConfidence(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null;
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  return Math.max(0, Math.min(100, Math.round(num)));
+}
+
+// 交易决策互斥锁：防止 cron 触发的上一轮尚未结束，下一轮就覆盖决策上下文
+let isTradingDecisionRunning = false;
+
 async function executeTradingDecision() {
+  if (isTradingDecisionRunning) {
+    logger.warn("上一轮交易决策仍在执行，跳过本轮（互斥锁保护）");
+    return;
+  }
+  isTradingDecisionRunning = true;
+
+  let decisionId: number | null = null; // hoist 到外层作用域，确保异常路径也能 UPDATE
+
   iterationCount++;
   const minutesElapsed = Math.floor((Date.now() - tradingStartTime.getTime()) / 60000);
   const intervalMinutes = Number.parseInt(process.env.TRADING_INTERVAL_MINUTES || "5");
-  
+
   logger.info(`\n${"=".repeat(80)}`);
   logger.info(`交易周期 #${iterationCount} (运行${minutesElapsed}分钟)`);
   logger.info(`${"=".repeat(80)}\n`);
@@ -1610,7 +1687,45 @@ async function executeTradingDecision() {
     
     // 传递市场数据给Agent（用于子Agent）
     const agent = await createTradingAgent(intervalMinutes, marketData);
-    
+
+    // 获取策略信息（用于 agent_decisions 和决策上下文）
+    const decisionStrategy = getTradingStrategy();
+    const decisionStrategyParams = getStrategyParams(decisionStrategy);
+
+    // 生成本周期追踪 UUID
+    const decisionTraceId = crypto.randomUUID();
+
+    // 在 agent.generateText 之前先 INSERT pending agent_decisions，
+    // 这样工具执行时可以通过决策上下文获取正确的 decisionId
+    const pendingResult = await dbClient.execute({
+      sql: `INSERT INTO agent_decisions
+            (timestamp, iteration, market_analysis, decision, actions_taken, account_value, positions_count,
+             strategy, prompt_version, params_snapshot, decision_trace_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      args: [
+        getChinaTimeISO(),
+        iterationCount,
+        '',  // market_analysis — 在 generateText 完成后 UPDATE
+        '',  // decision — 在 generateText 完成后 UPDATE
+        '[]',
+        accountInfo.totalBalance,
+        positions.length,
+        decisionStrategy,
+        'v4.0',
+        JSON.stringify(decisionStrategyParams),
+        decisionTraceId,
+      ],
+    });
+    decisionId = Number(pendingResult.lastInsertRowid ?? 0);
+
+    // 设置决策上下文，让 openPosition / closePosition 工具可以获取正确的 decisionId
+    setCurrentDecisionContext({
+      decisionId,
+      traceId: decisionTraceId,
+      strategy: decisionStrategy,
+      paramsSnapshot: JSON.stringify(decisionStrategyParams),
+    });
+
     try {
       // 设置足够大的 maxOutputTokens 以避免输出被截断
       // DeepSeek API 限制: max_tokens 范围为 [1, 8192]
@@ -1698,22 +1813,31 @@ async function executeTradingDecision() {
       logger.info(decisionText || "无决策输出");
       logger.info("=".repeat(80) + "\n");
       
-      // 保存决策记录
+      // 从 AI 输出中解析结构化字段
+      const parsedFields = parseStructuredDecisionFields(decisionText);
+      if (parsedFields.intended_action) {
+        logger.info(`解析到结构化字段: intended_action=${parsedFields.intended_action}, market_regime=${parsedFields.market_regime || 'N/A'}, target_symbol=${parsedFields.target_symbol || 'N/A'}`);
+      } else {
+        logger.warn("未能从 AI 输出中解析到 intended_action 结构化字段（AI 可能未按要求输出）");
+      }
+
+      // 更新之前 INSERT 的 pending agent_decisions（当前周期的 decisionId 已存在）
       await dbClient.execute({
-        sql: `INSERT INTO agent_decisions 
-              (timestamp, iteration, market_analysis, decision, actions_taken, account_value, positions_count)
-              VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        sql: `UPDATE agent_decisions
+              SET market_analysis = ?, decision = ?, market_regime = ?, intended_action = ?,
+                  target_symbol = ?, confidence = ?
+              WHERE id = ?`,
         args: [
-          getChinaTimeISO(),
-          iterationCount,
           JSON.stringify(marketData),
           decisionText,
-          "[]",
-          accountInfo.totalBalance,
-          positions.length,
+          parsedFields.market_regime || null,
+          parsedFields.intended_action || null,
+          parsedFields.target_symbol || null,
+          parsedFields.confidence ?? null,
+          decisionId,
         ],
       });
-      
+
       // Agent 执行后重新同步持仓数据（优化：只调用一次API）
       const updatedRawPositions = await exchangeClient.getPositions();
       await syncPositionsFromGate(updatedRawPositions);
@@ -1747,29 +1871,70 @@ async function executeTradingDecision() {
       
     } catch (agentError) {
       logger.error("Agent 执行失败:", agentError as any);
+
+      // 异常路径：UPDATE pending agent_decisions 标记为 error
+      if (decisionId) {
+        try {
+          await dbClient.execute({
+            sql: `UPDATE agent_decisions
+                  SET decision = ?, intended_action = ?
+                  WHERE id = ?`,
+            args: [
+              `AGENT_ERROR: ${(agentError as any)?.message || 'unknown'}`,
+              'error',
+              decisionId,
+            ],
+          });
+        } catch (updateErr) {
+          logger.error("更新 pending decision 失败:", updateErr as any);
+        }
+      }
+
       try {
         await syncPositionsFromGate();
       } catch (syncError) {
         logger.error("同步失败:", syncError as any);
       }
     }
-    
+
     // 每个周期结束时自动修复历史盈亏记录
     try {
       logger.info("检查并修复历史盈亏记录...");
       await fixHistoricalPnlRecords();
     } catch (fixError) {
       logger.error("修复历史盈亏失败:", fixError as any);
-      // 不影响主流程，继续执行
     }
-    
+
   } catch (error) {
     logger.error("交易循环执行失败:", error as any);
+
+    // 最外层异常：同样需要 UPDATE pending decision
+    if (decisionId) {
+      try {
+        await dbClient.execute({
+          sql: `UPDATE agent_decisions
+                SET decision = ?, intended_action = ?
+                WHERE id = ?`,
+          args: [
+            `FATAL_ERROR: ${(error as any)?.message || 'unknown'}`,
+            'error',
+            decisionId,
+          ],
+        });
+      } catch {
+        // 数据库也可能已不可用，忽略
+      }
+    }
+
     try {
       await syncPositionsFromGate();
     } catch (recoveryError) {
       logger.error("恢复失败:", recoveryError as any);
     }
+  } finally {
+    // 无论成功、失败、异常，都必须清理上下文和互斥锁
+    clearCurrentDecisionContext();
+    isTradingDecisionRunning = false;
   }
 }
 

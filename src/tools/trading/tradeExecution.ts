@@ -27,6 +27,7 @@ import { createLogger } from "../../utils/loggerUtils";
 import { getChinaTimeISO } from "../../utils/timeUtils";
 import { RISK_PARAMS } from "../../config/riskParams";
 import { getQuantoMultiplier } from "../../utils/contractUtils";
+import { getCurrentDecisionContext } from "../../agents/decisionContext";
 
 const logger = createLogger({
   name: "trade-execution",
@@ -108,13 +109,25 @@ async function getProfitProtectionStopPercent(currentPnlPercent: number): Promis
   return 0;
 }
 
-const MIN_SAME_SYMBOL_COOLDOWN_CYCLES = 3;
-const configuredSameSymbolCooldownCycles = Number.parseFloat(
-  process.env.SAME_SYMBOL_COOLDOWN_CYCLES || `${MIN_SAME_SYMBOL_COOLDOWN_CYCLES}`,
-);
-const SAME_SYMBOL_COOLDOWN_CYCLES = Number.isFinite(configuredSameSymbolCooldownCycles)
-  ? Math.max(MIN_SAME_SYMBOL_COOLDOWN_CYCLES, configuredSameSymbolCooldownCycles)
-  : MIN_SAME_SYMBOL_COOLDOWN_CYCLES;
+/**
+ * 从策略参数中获取同币种冷却周期数
+ * 优先使用策略配置，其次使用环境变量，兜底为 3
+ */
+async function getSameSymbolCooldownCycles(): Promise<number> {
+  const defaultCooldown = 3;
+  try {
+    const { getTradingStrategy, getStrategyParams } = await import("../../agents/tradingAgent.js");
+    const strategy = getTradingStrategy();
+    const params = getStrategyParams(strategy);
+    if (params.sameSymbolCooldownCycles && Number.isFinite(params.sameSymbolCooldownCycles)) {
+      return Math.max(1, params.sameSymbolCooldownCycles);
+    }
+  } catch {
+    // 静默处理
+  }
+  const envValue = Number.parseFloat(process.env.SAME_SYMBOL_COOLDOWN_CYCLES || `${defaultCooldown}`);
+  return Number.isFinite(envValue) ? Math.max(1, envValue) : defaultCooldown;
+}
 
 /**
  * 开仓工具
@@ -204,17 +217,18 @@ export const openPositionTool = createTool({
         const now = Date.now();
         const minutesSinceClose = (now - closeTime) / (1000 * 60);
         const intervalMinutes = Number.parseInt(process.env.TRADING_INTERVAL_MINUTES || "5");
-        const cooldownMinutes = intervalMinutes * SAME_SYMBOL_COOLDOWN_CYCLES;
+        const sameSymbolCooldownCycles = await getSameSymbolCooldownCycles();
+        const cooldownMinutes = intervalMinutes * sameSymbolCooldownCycles;
 
-        // 如果距离上次平仓时间不足 3 个交易周期，拒绝开仓
+        // 如果距离上次平仓时间不足冷却周期，拒绝开仓
         if (minutesSinceClose < cooldownMinutes) {
           return {
             success: false,
-            message: `拒绝开仓 ${symbol}：该币种在 ${minutesSinceClose.toFixed(1)} 分钟前刚平仓，需要等待至少 ${cooldownMinutes.toFixed(1)} 分钟（${SAME_SYMBOL_COOLDOWN_CYCLES} 个交易周期）后才能重新开仓。这是为了防止同一币种短时间内连续试错。`,
+            message: `拒绝开仓 ${symbol}：该币种在 ${minutesSinceClose.toFixed(1)} 分钟前刚平仓，需要等待至少 ${cooldownMinutes.toFixed(1)} 分钟（${sameSymbolCooldownCycles} 个交易周期）后才能重新开仓。这是为了防止同一币种短时间内连续试错。`,
           };
         }
-        
-        logger.info(`${symbol} 距离上次平仓已 ${minutesSinceClose.toFixed(1)} 分钟，通过冷静期检查（冷静期：${cooldownMinutes.toFixed(1)}分钟 / ${SAME_SYMBOL_COOLDOWN_CYCLES}个周期）`);
+
+        logger.info(`${symbol} 距离上次平仓已 ${minutesSinceClose.toFixed(1)} 分钟，通过冷静期检查（冷静期：${cooldownMinutes.toFixed(1)}分钟 / ${sameSymbolCooldownCycles}个周期）`);
       }
       
       // 4. 获取账户信息
@@ -460,9 +474,9 @@ export const openPositionTool = createTool({
       const lotSize = Number.parseFloat(contractInfo.lotSize || contractInfo.order_size_round || "1");
       
       // 计算可以开多少张合约
-      // adjustedAmountUsdt = (quantity * quantoMultiplier * currentPrice) / leverage
-      // => quantity = (adjustedAmountUsdt * leverage) / (quantoMultiplier * currentPrice)
-      let quantity = (adjustedAmountUsdt * leverage) / (quantoMultiplier * currentPrice);
+      // adjustedAmountUsdt = (quantity * quantoMultiplier * currentPrice) / adjustedLeverage
+      // => quantity = (adjustedAmountUsdt * adjustedLeverage) / (quantoMultiplier * currentPrice)
+      let quantity = (adjustedAmountUsdt * adjustedLeverage) / (quantoMultiplier * currentPrice);
       
       // 根据 lotSize 调整数量精度（向上取整到最接近的有效精度）
       // 例如：lotSize=0.01，quantity=0.123 -> 向上取整到 0.13
@@ -489,17 +503,17 @@ export const openPositionTool = createTool({
       
       // 最后验证：如果 size 为 0 或者太小，放弃开仓
       if (Math.abs(size) < minSize) {
-        const minMargin = (minSize * quantoMultiplier * currentPrice) / leverage;
+        const minMargin = (minSize * quantoMultiplier * currentPrice) / adjustedLeverage;
         return {
           success: false,
-          message: `计算的数量 ${Math.abs(size)} 张小于最小限制 ${minSize} 张，需要至少 ${minMargin.toFixed(2)} USDT 保证金（当前${adjustedAmountUsdt.toFixed(2)} USDT，杠杆${leverage}x）`,
+          message: `计算的数量 ${Math.abs(size)} 张小于最小限制 ${minSize} 张，需要至少 ${minMargin.toFixed(2)} USDT 保证金（当前${adjustedAmountUsdt.toFixed(2)} USDT，杠杆${adjustedLeverage}x）`,
         };
       }
       
       // 计算实际使用的保证金
-      let actualMargin = (Math.abs(size) * quantoMultiplier * currentPrice) / leverage;
-      
-      logger.info(`开仓 ${symbol} ${side === "long" ? "做多" : "做空"} ${Math.abs(size)}张 (杠杆${leverage}x)`);
+      let actualMargin = (Math.abs(size) * quantoMultiplier * currentPrice) / adjustedLeverage;
+
+      logger.info(`开仓 ${symbol} ${side === "long" ? "做多" : "做空"} ${Math.abs(size)}张 (杠杆${adjustedLeverage}x)`);
       
       //  市价单开仓（不设置止盈止损）
       const order = await client.placeOrder({
@@ -602,10 +616,17 @@ export const openPositionTool = createTool({
       // 实际执行: long开仓=买入(+size), short开仓=卖出(-size)
       // 映射状态：Gate.io finished -> filled, open -> pending
       const dbStatus = finalOrderStatus === 'finished' ? 'filled' : 'pending';
-      
+
+      // 获取策略归因信息（从决策上下文，而非查询最新 agent_decisions）
+      const decisionCtx = getCurrentDecisionContext();
+      const openTradeStrategy = decisionCtx?.strategy ?? currentStrategy;
+      const openTradeDecisionId = decisionCtx?.decisionId ?? null;
+      const openTradeTraceId = decisionCtx?.traceId ?? null;
+
       await dbClient.execute({
-        sql: `INSERT INTO trades (order_id, symbol, side, type, price, quantity, leverage, fee, timestamp, status)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        sql: `INSERT INTO trades (order_id, symbol, side, type, price, quantity, leverage, fee, timestamp, status,
+              strategy, strategy_version, prompt_version, decision_id, params_snapshot, decision_trace_id)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           order.id?.toString() || "",
           symbol,
@@ -617,6 +638,12 @@ export const openPositionTool = createTool({
           fee,            // 手续费
           getChinaTimeISO(),
           dbStatus,
+          openTradeStrategy,
+          'v4.0',          // strategy_version
+          'v4.0',          // prompt_version
+          openTradeDecisionId,
+          JSON.stringify(currentStrategyParams),
+          openTradeTraceId,
         ],
       });
       
@@ -739,9 +766,9 @@ export const openPositionTool = createTool({
         size: Math.abs(size), // 合约张数
         contractAmount, // 实际币的数量
         price: actualFillPrice,
-        leverage,
+        leverage: adjustedLeverage,
         actualMargin,
-        message: `✅ 成功开仓 ${symbol} ${side === "long" ? "做多" : "做空"} ${Math.abs(size)} 张 (${contractAmount.toFixed(4)} ${symbol})，成交价 ${actualFillPrice.toFixed(2)}，保证金 ${actualMargin.toFixed(2)} USDT，杠杆 ${leverage}x。⚠️ 未设置止盈止损，请在每个周期主动决策是否平仓。`,
+        message: `✅ 成功开仓 ${symbol} ${side === "long" ? "做多" : "做空"} ${Math.abs(size)} 张 (${contractAmount.toFixed(4)} ${symbol})，成交价 ${actualFillPrice.toFixed(2)}，保证金 ${actualMargin.toFixed(2)} USDT，杠杆 ${adjustedLeverage}x。⚠️ 未设置止盈止损，请在每个周期主动决策是否平仓。`,
       };
     } catch (error: any) {
       return {
@@ -1050,10 +1077,17 @@ export const closePositionTool = createTool({
       // fee: 总手续费（开仓+平仓）
       // 映射状态：Gate.io finished -> filled, open -> pending
       const dbStatus = finalOrderStatus === 'finished' ? 'filled' : 'pending';
-      
+
+      // 获取策略归因信息（从决策上下文）
+      const closeDecisionCtx = getCurrentDecisionContext();
+      const closeTradeStrategy = closeDecisionCtx?.strategy ?? 'unknown';
+      const closeTradeDecisionId = closeDecisionCtx?.decisionId ?? null;
+      const closeTradeTraceId = closeDecisionCtx?.traceId ?? null;
+
       await dbClient.execute({
-        sql: `INSERT INTO trades (order_id, symbol, side, type, price, quantity, leverage, pnl, fee, timestamp, status)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        sql: `INSERT INTO trades (order_id, symbol, side, type, price, quantity, leverage, pnl, fee, timestamp, status,
+              strategy, decision_id, decision_trace_id)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         args: [
           order.id?.toString() || "",
           symbol,
@@ -1066,6 +1100,9 @@ export const closePositionTool = createTool({
           totalFee,         // 总手续费（开仓+平仓）
           getChinaTimeISO(),
           dbStatus,
+          closeTradeStrategy,
+          closeTradeDecisionId,
+          closeTradeTraceId,
         ],
       });
       

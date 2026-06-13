@@ -256,9 +256,39 @@ export function generateAiAutonomousPrompt(params: StrategyParams, context: Stra
 - 你可以在每个周期做出新的决策
 - 你可以持有仓位跨越多个周期
 
+**决策记录要求 — 必须在你的回复末尾输出 JSON 代码块**：
+
+\`\`\`json
+{
+  "market_regime": "trend_up",
+  "intended_action": "open_long",
+  "target_symbol": "BTC",
+  "confidence": 70,
+  "entry_reason": "",
+  "missing_confirmation": "",
+  "next_observation_price": "",
+  "invalidation_condition": "",
+  "stop_loss_plan": "",
+  "take_profit_plan": "",
+  "risk_reward_ratio": "",
+  "close_reason": "none",
+  "close_detail": ""
+}
+\`\`\`
+
+字段说明：
+- market_regime: trend_up / trend_down / range / high_volatility / unclear
+- intended_action: observe / open_long / open_short / close / reduce / hold
+- target_symbol: 你的决策目标币种，或 none
+- confidence: 0-100 整数，你对当前判断的把握程度
+- 开仓时：invalidation_condition / stop_loss_plan / take_profit_plan / risk_reward_ratio 必填
+- 平仓时：close_reason (stop_loss / take_profit / trailing_stop / time_exit / logic_invalidated / risk_reduction) + close_detail 必填
+- 观望时：missing_confirmation + next_observation_price 必填
+
 **开始交易**：
 现在，请基于下方提供的市场数据和账户信息，完全自主地分析市场并做出交易决策。
 记住：没有任何建议和限制（除了系统硬性风控底线），一切由你自主决定。
+别忘了在回复末尾输出 JSON 代码块。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 `;

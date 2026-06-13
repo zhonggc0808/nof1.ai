@@ -101,7 +101,10 @@ export function getAlphaBetaStrategy(maxLeverage: number): StrategyParams {
     // ==================== 代码级保护开关 ====================
     enableCodeLevelProtection: true,
     allowAiOverrideProtection: true,
-    
+
+    // ==================== 冷却周期 ====================
+    sameSymbolCooldownCycles: 3,
+
     // ==================== 最大空仓时间限制 ====================
     maxIdleHours: 24,  // 延长到24小时，避免在没有好机会时被强迫开仓
   };
@@ -209,7 +212,7 @@ export function generateAlphaBetaPrompt(
 - **逆势交易**：允许直接做反转或抄底摸顶，但必须写明核心逻辑、失效条件和止损位置
 - **仓位上限**：单笔 ≤ 账户总资金的40%，总保证金 ≤ 60%
 - **杠杆**：${params.leverageMin}-${params.leverageMax}倍，建议从${params.leverageMin}倍起步，根据信号强度逐步提高
-- **同币种冷却**：同币种平仓后，至少等待 3 个交易周期才能重新开仓
+- **同币种冷却**：同币种平仓后，至少等待 ${params.sameSymbolCooldownCycles ?? 3} 个交易周期才能重新开仓
 - **持仓数**：最多同时${context.maxPositions}个
 - **最大持仓时间**：${context.maxHoldingHours}小时
 - **仓位金额 = 账户总资金 × 仓位比例**，禁止固定金额开仓
@@ -257,23 +260,84 @@ export function generateAlphaBetaPrompt(
 
 **【4. 最终决策】**
 
-【决策】
-- 操作：观望 / 开多 / 开空 / 平仓
-- 理由：用2-3句话解释你为什么做这个决定，技术面和消息面的关键依据是什么
-- 信心程度：低/中/高（影响仓位大小）
+先用自然语言写出你的决策理由（2-3句话），然后必须填写以下结构化字段。
 
-如果开仓：
-- 币种：XXXUSDT
-- 方向：LONG/SHORT
-- 理由：一句话核心逻辑（例如："BTC 1H金叉+突破阻力位+ETF资金流入利好"）
-- 仓位：XX USDT（= 总资金 XX × XX%）
-- 杠杆：X倍
-- 止损：-3%（对应价格 XXXX）
-- 止盈目标：+5%/+10%/+15%
+═══════════════════════════════════════
+【结构化字段 — 所有决策都必须填写】
+═══════════════════════════════════════
 
-如果观望：
-- 说明为什么当前没有好的机会
-- 你在等待什么条件出现
+intended_action: observe / open_long / open_short / close / reduce / hold
+target_symbol: ${context.tradingSymbols.join(" / ")} 中选一个，如果只观察则填最接近开仓的币种，如果没有则填 none
+confidence: 0-100（你对当前市场判断的把握程度）
+entry_reason: 一句话核心逻辑
+missing_confirmation: 如果不开仓，缺少什么确认条件；如果开仓，填 none
+next_observation_price: 下一周期重点观察的价位，如 BTC 90500
+
+═══════════════════════════════════════
+如果 intended_action = open_long 或 open_short，还必须填写：
+═══════════════════════════════════════
+
+invalidation_condition: 价格跌破/站上哪个位置就证明判断错了（必须具体价位）
+stop_loss_plan: 止损设置在什么价位，为什么选这个位置
+take_profit_plan: 止盈分几阶段，每阶段目标和比例
+risk_reward_ratio: 盈亏比，必须 ≥ 1.5 才能开仓
+（如果是反转单：仓位不得超过一般机会区间 12-15%）
+
+═══════════════════════════════════════
+如果 intended_action = close 或 reduce，还必须填写：
+═══════════════════════════════════════
+
+close_reason: stop_loss / take_profit / trailing_stop / time_exit / logic_invalidated / risk_reduction
+close_detail: 一句话说明（例如："移动止盈触发，从+6%保护线回撤"）
+
+═══════════════════════════════════════
+如果 intended_action = observe，还必须填写：
+═══════════════════════════════════════
+
+- 当前最接近开仓的币种是什么，为什么还没开
+- 缺少哪个确认条件（具体到：等RSI回调到XX、等价格突破XX、等消息面明朗等）
+- 下一周期重点观察哪个价位或指标
+
+═══════════════════════════════════════
+【结构化 JSON — 必须在决策末尾输出，不可省略】
+═══════════════════════════════════════
+
+在全部决策文字之后，必须输出一个 JSON 代码块，字段严格按以下格式：
+
+\`\`\`json
+{
+  "market_regime": "trend_up",
+  "intended_action": "open_long",
+  "target_symbol": "BTC",
+  "confidence": 70,
+  "entry_reason": "BTC 1H金叉+突破阻力位+放量确认",
+  "missing_confirmation": "none",
+  "next_observation_price": "BTC 90500",
+  "invalidation_condition": "BTC跌破89800则判断错误",
+  "stop_loss_plan": "止损设在89700（前低之下）",
+  "take_profit_plan": "第一止盈91000(50%)，第二止盈92000(50%)",
+  "risk_reward_ratio": "2.1",
+  "close_reason": "none",
+  "close_detail": ""
+}
+\`\`\`
+
+字段说明：
+- market_regime: trend_up / trend_down / range / high_volatility / unclear（必填）
+- intended_action: observe / open_long / open_short / close / reduce / hold（必填）
+- target_symbol: 币种代码或 none（必填）
+- confidence: 0-100 整数（必填）
+- entry_reason: 一句话核心逻辑（必填）
+- missing_confirmation: 不开仓时写缺什么条件，开仓时填 "none"（必填）
+- next_observation_price: 下一周期观察价位（必填）
+- invalidation_condition: 开仓时必填，不开仓填 ""（开仓必填）
+- stop_loss_plan: 开仓时必填，不开仓填 ""（开仓必填）
+- take_profit_plan: 开仓时必填，不开仓填 ""（开仓必填）
+- risk_reward_ratio: 开仓时必填，不开仓填 ""（开仓时必填且>=1.5）
+- close_reason: 平仓时必填六分类，否则填 "none"（必填）
+- close_detail: 平仓时必填一句话，否则填 ""（必填）
+
+**重要：JSON 代码块是所有结构化字段的唯一权威来源。前面【结构化字段】区域的文本仅用于辅助阅读。如果 JSON 与文本不一致，以 JSON 为准。**
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 五、系统参数
@@ -288,6 +352,28 @@ export function generateAlphaBetaPrompt(
 - 最大杠杆：${params.leverageMax}倍
 - 极端止损：单笔亏损 ${context.extremeStopLossPercent}% 系统强制平仓
 - 手续费：开平各约0.05%，往返0.1%，高频交易成本高昂
+- 同币种冷却：平仓后等待 ${params.sameSymbolCooldownCycles ?? 3} 个周期
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+六、上一轮回顾与反思
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+每轮开始前，快速回顾以下问题（如果历史记录中有上一轮的决策）：
+
+1. **上一次开仓理由是否仍成立？**
+   - 如果仍成立且持仓中：继续持有，管理止盈止损
+   - 如果不再成立：考虑平仓退出
+
+2. **如果上一笔交易亏损了，亏损原因是什么？**
+   - 方向判断错误（多空方向不对）
+   - 入场时机过早（方向对但进场太早被打止损）
+   - 止损设置太紧（价格触及止损后反转）
+   - 市场突发消息（消息面重大变化）
+   - 不要因为单笔亏损就机械停止交易，但连亏2笔以上应降低仓位或提高确认要求
+
+3. **本轮关注重点**
+   - 上一轮提到的最接近开仓的币种，条件现在满足了吗？
+   - 上一轮关注的价位被触及了吗？发生了什么？
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
